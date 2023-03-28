@@ -283,7 +283,6 @@ AttributionSourceState AudioFlinger::checkAttributionSourcePackage(
                 return opPackageLegacy == package; }) == packages.end()) {
             ALOGW("The package name(%s) provided does not correspond to the uid %d",
                     attributionSource.packageName.value_or("").c_str(), attributionSource.uid);
-            checkedAttributionSource.packageName = std::optional<std::string>();
         }
     }
     return checkedAttributionSource;
@@ -582,6 +581,33 @@ status_t AudioFlinger::openMmapStream(MmapStreamInterface::stream_direction_t di
     audio_io_handle_t io = AUDIO_IO_HANDLE_NONE;
     audio_port_handle_t portId = AUDIO_PORT_HANDLE_NONE;
     audio_attributes_t localAttr = *attr;
+
+    // TODO b/182392553: refactor or make clearer
+    pid_t clientPid =
+        VALUE_OR_RETURN_STATUS(aidl2legacy_int32_t_pid_t(client.attributionSource.pid));
+    bool updatePid = (clientPid == (pid_t)-1);
+    const uid_t callingUid = IPCThreadState::self()->getCallingUid();
+
+    AttributionSourceState adjAttributionSource = client.attributionSource;
+    if (!isAudioServerOrMediaServerOrSystemServerOrRootUid(callingUid)) {
+        uid_t clientUid =
+            VALUE_OR_RETURN_STATUS(aidl2legacy_int32_t_uid_t(client.attributionSource.uid));
+        ALOGW_IF(clientUid != callingUid,
+                "%s uid %d tried to pass itself off as %d",
+                __FUNCTION__, callingUid, clientUid);
+        adjAttributionSource.uid = VALUE_OR_RETURN_STATUS(legacy2aidl_uid_t_int32_t(callingUid));
+        updatePid = true;
+    }
+    if (updatePid) {
+        const pid_t callingPid = IPCThreadState::self()->getCallingPid();
+        ALOGW_IF(clientPid != (pid_t)-1 && clientPid != callingPid,
+                 "%s uid %d pid %d tried to pass itself off as pid %d",
+                 __func__, callingUid, callingPid, clientPid);
+        adjAttributionSource.pid = VALUE_OR_RETURN_STATUS(legacy2aidl_pid_t_int32_t(callingPid));
+    }
+    adjAttributionSource = AudioFlinger::checkAttributionSourcePackage(
+            adjAttributionSource);
+
     if (direction == MmapStreamInterface::DIRECTION_OUTPUT) {
         audio_config_t fullConfig = AUDIO_CONFIG_INITIALIZER;
         fullConfig.sample_rate = config->sample_rate;
@@ -591,7 +617,7 @@ status_t AudioFlinger::openMmapStream(MmapStreamInterface::stream_direction_t di
         bool isSpatialized;
         ret = AudioSystem::getOutputForAttr(&localAttr, &io,
                                             actualSessionId,
-                                            &streamType, client.attributionSource,
+                                            &streamType, adjAttributionSource,
                                             &fullConfig,
                                             (audio_output_flags_t)(AUDIO_OUTPUT_FLAG_MMAP_NOIRQ |
                                                     AUDIO_OUTPUT_FLAG_DIRECT),
@@ -602,7 +628,7 @@ status_t AudioFlinger::openMmapStream(MmapStreamInterface::stream_direction_t di
         ret = AudioSystem::getInputForAttr(&localAttr, &io,
                                               RECORD_RIID_INVALID,
                                               actualSessionId,
-                                              client.attributionSource,
+                                              adjAttributionSource,
                                               config,
                                               AUDIO_INPUT_FLAG_MMAP_NOIRQ, deviceId, &portId);
     }
@@ -1051,7 +1077,7 @@ status_t AudioFlinger::createTrack(const media::CreateTrackRequest& _input,
     audio_attributes_t localAttr = input.attr;
 
     AttributionSourceState adjAttributionSource = input.clientInfo.attributionSource;
-    if (!isAudioServerOrMediaServerUid(callingUid)) {
+    if (!isAudioServerOrMediaServerOrSystemServerOrRootUid(callingUid)) {
         ALOGW_IF(clientUid != callingUid,
                 "%s uid %d tried to pass itself off as %d",
                 __FUNCTION__, callingUid, clientUid);
@@ -1067,6 +1093,8 @@ status_t AudioFlinger::createTrack(const media::CreateTrackRequest& _input,
         clientPid = callingPid;
         adjAttributionSource.pid = VALUE_OR_RETURN_STATUS(legacy2aidl_pid_t_int32_t(callingPid));
     }
+    adjAttributionSource = AudioFlinger::checkAttributionSourcePackage(
+            adjAttributionSource);
 
     audio_session_t sessionId = input.sessionId;
     if (sessionId == AUDIO_SESSION_ALLOCATE) {
@@ -2337,7 +2365,7 @@ status_t AudioFlinger::createRecord(const media::CreateRecordRequest& _input,
     const uid_t callingUid = IPCThreadState::self()->getCallingUid();
     const uid_t currentUid = VALUE_OR_RETURN_STATUS(legacy2aidl_uid_t_int32_t(
            adjAttributionSource.uid));
-    if (!isAudioServerOrMediaServerUid(callingUid)) {
+    if (!isAudioServerOrMediaServerOrSystemServerOrRootUid(callingUid)) {
         ALOGW_IF(currentUid != callingUid,
                 "%s uid %d tried to pass itself off as %d",
                 __FUNCTION__, callingUid, currentUid);
@@ -2353,7 +2381,8 @@ status_t AudioFlinger::createRecord(const media::CreateRecordRequest& _input,
                  __func__, callingUid, callingPid, currentPid);
         adjAttributionSource.pid = VALUE_OR_RETURN_STATUS(legacy2aidl_pid_t_int32_t(callingPid));
     }
-
+    adjAttributionSource = AudioFlinger::checkAttributionSourcePackage(
+            adjAttributionSource);
     // we don't yet support anything other than linear PCM
     if (!audio_is_valid_format(input.config.format) || !audio_is_linear_pcm(input.config.format)) {
         ALOGE("createRecord() invalid format %#x", input.config.format);
@@ -3056,6 +3085,20 @@ status_t AudioFlinger::closeOutput_nonvirtual(audio_io_handle_t output)
 
 
             mPlaybackThreads.removeItem(output);
+            // Save AUDIO_SESSION_OUTPUT_MIX effect to chain orphans
+            // Output Mix Effect session is used to manage Music Effect by AudioPolicy Manager.
+            // It exists across all playback threads.
+            if (playbackThread->type() == ThreadBase::MIXER) {
+                const uint32_t sessionType =
+                        playbackThread->hasAudioSession(AUDIO_SESSION_OUTPUT_MIX);
+                if ((sessionType & ThreadBase::EFFECT_SESSION) != 0) {
+                    Mutex::Autolock _sppl(playbackThread->mLock);
+                    auto mixChain = playbackThread->getEffectChain_l(AUDIO_SESSION_OUTPUT_MIX);
+                    ALOGW("%s() output %d moving mix session to orphans", __func__, output);
+                    playbackThread->removeEffectChain_l(mixChain);
+                    putOrphanEffectChain_l(mixChain);
+                }
+            }
             // save all effects to the default thread
             if (mPlaybackThreads.size()) {
                 PlaybackThread *dstThread = checkPlaybackThread_l(mPlaybackThreads.keyAt(0));
@@ -3768,6 +3811,12 @@ void AudioFlinger::updateSecondaryOutputsForTrack_l(
 
         using namespace std::chrono_literals;
         auto inChannelMask = audio_channel_mask_out_to_in(track->channelMask());
+        if (inChannelMask == AUDIO_CHANNEL_INVALID) {
+            // The downstream PatchTrack has the proper output channel mask,
+            // so if there is no input channel mask equivalent, we can just
+            // use an index mask here to create the PatchRecord.
+            inChannelMask = audio_channel_mask_out_to_in_index_mask(track->channelMask());
+        }
         sp patchRecord = new RecordThread::PatchRecord(nullptr /* thread */,
                                                        track->sampleRate(),
                                                        inChannelMask,
@@ -3970,7 +4019,7 @@ status_t AudioFlinger::createEffect(const media::CreateEffectRequest& request,
     const uid_t callingUid = IPCThreadState::self()->getCallingUid();
     adjAttributionSource.uid = VALUE_OR_RETURN_STATUS(legacy2aidl_uid_t_int32_t(callingUid));
     pid_t currentPid = VALUE_OR_RETURN_STATUS(aidl2legacy_int32_t_pid_t(adjAttributionSource.pid));
-    if (currentPid == -1 || !isAudioServerOrMediaServerUid(callingUid)) {
+    if (currentPid == -1 || !isAudioServerOrMediaServerOrSystemServerOrRootUid(callingUid)) {
         const pid_t callingPid = IPCThreadState::self()->getCallingPid();
         ALOGW_IF(currentPid != -1 && currentPid != callingPid,
                  "%s uid %d pid %d tried to pass itself off as pid %d",
@@ -3978,6 +4027,7 @@ status_t AudioFlinger::createEffect(const media::CreateEffectRequest& request,
         adjAttributionSource.pid = VALUE_OR_RETURN_STATUS(legacy2aidl_pid_t_int32_t(callingPid));
         currentPid = callingPid;
     }
+    adjAttributionSource = AudioFlinger::checkAttributionSourcePackage(adjAttributionSource);
 
     ALOGV("createEffect pid %d, effectClient %p, priority %d, sessionId %d, io %d, factory %p",
           adjAttributionSource.pid, effectClient.get(), priority, sessionId, io,
@@ -4135,7 +4185,8 @@ status_t AudioFlinger::createEffect(const media::CreateEffectRequest& request,
             // before creating the AudioEffect or the io handle must be specified.
             //
             // Detect if the effect is created after an AudioRecord is destroyed.
-            if (getOrphanEffectChain_l(sessionId).get() != nullptr) {
+            if ((sessionId != AUDIO_SESSION_OUTPUT_MIX) &&
+                    getOrphanEffectChain_l(sessionId).get() != nullptr) {
                 ALOGE("%s: effect %s with no specified io handle is denied because the AudioRecord"
                       " for session %d no longer exists",
                       __func__, descOut.name, sessionId);
@@ -4191,7 +4242,8 @@ status_t AudioFlinger::createEffect(const media::CreateEffectRequest& request,
                     goto Exit;
                 }
             }
-        } else {
+        }
+        if (thread->type() == ThreadBase::RECORD || sessionId == AUDIO_SESSION_OUTPUT_MIX) {
             // Check if one effect chain was awaiting for an effect to be created on this
             // session and used it instead of creating a new one.
             sp<EffectChain> chain = getOrphanEffectChain_l(sessionId);
@@ -4278,7 +4330,21 @@ status_t AudioFlinger::moveEffects(audio_session_t sessionId, audio_io_handle_t 
         return NO_ERROR;
     }
     PlaybackThread *srcThread = checkPlaybackThread_l(srcOutput);
-    if (srcThread == NULL) {
+    const bool foundOrphanForSessionId = (mOrphanEffectChains.indexOfKey(sessionId) >= 0);
+    if (srcThread == NULL && !foundOrphanForSessionId && sessionId == AUDIO_SESSION_OUTPUT_MIX) {
+        ALOGW("%s() session %d not found in orphans, checking other mix", __func__, sessionId);
+        for (size_t i = 0; i < mPlaybackThreads.size(); i++) {
+            sp<PlaybackThread> pt = mPlaybackThreads.valueAt(i);
+            const uint32_t sessionType = pt->hasAudioSession(sessionId);
+            if ((pt->type() == ThreadBase::MIXER) &&
+                    ((sessionType & ThreadBase::EFFECT_SESSION) != 0)) {
+                srcThread = pt.get();
+                ALOGW("%s() found srcOutput %d hosting session %d", __func__, pt->id(), sessionId);
+                break;
+            }
+        }
+    }
+    if (srcThread == NULL && !foundOrphanForSessionId) {
         ALOGW("moveEffects() bad srcOutput %d", srcOutput);
         return BAD_VALUE;
     }
@@ -4289,6 +4355,11 @@ status_t AudioFlinger::moveEffects(audio_session_t sessionId, audio_io_handle_t 
     }
 
     Mutex::Autolock _dl(dstThread->mLock);
+    if (foundOrphanForSessionId) {
+        ALOGW("moveEffects() found session %d in orphan chains", sessionId);
+        sp<EffectChain> chain = getOrphanEffectChain_l(sessionId);
+        return dstThread->addEffectChain_l(chain);
+    }
     Mutex::Autolock _sl(srcThread->mLock);
     return moveEffectChain_l(sessionId, srcThread, dstThread);
 }

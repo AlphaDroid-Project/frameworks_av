@@ -82,7 +82,8 @@ class Camera3Device :
   friend class AidlCamera3Device;
   public:
 
-    explicit Camera3Device(const String8& id, bool overrideForPerfClass, bool legacyClient = false);
+    explicit Camera3Device(const String8& id, bool overrideForPerfClass, bool overrideToPortrait,
+            bool legacyClient = false);
 
     virtual ~Camera3Device();
     // Delete and optionally close native handles and clear the input vector afterward
@@ -788,7 +789,8 @@ class Camera3Device :
                 sp<HalInterface> interface,
                 const Vector<int32_t>& sessionParamKeys,
                 bool useHalBufManager,
-                bool supportCameraMute);
+                bool supportCameraMute,
+                bool overrideToPortrait);
         ~RequestThread();
 
         void     setNotificationListener(wp<NotificationListener> listener);
@@ -838,6 +840,9 @@ class Camera3Device :
          * waitUntilPaused to wait until the thread is paused.
          */
         void     setPaused(bool paused);
+
+        // set mRequestClearing - no new requests are expected to be queued to RequestThread
+        void setRequestClearing();
 
         /**
          * Wait until thread processes the capture request with settings'
@@ -993,7 +998,7 @@ class Camera3Device :
 
         wp<NotificationListener> mListener;
 
-        const String8&     mId;       // The camera ID
+        const String8      mId;       // The camera ID
         int                mStatusId; // The RequestThread's component ID for
                                       // status tracking
 
@@ -1065,6 +1070,7 @@ class Camera3Device :
 
         const bool         mUseHalBufManager;
         const bool         mSupportCameraMute;
+        const bool         mOverrideToPortrait;
     };
 
     virtual sp<RequestThread> createNewRequestThread(wp<Camera3Device> /*parent*/,
@@ -1072,7 +1078,8 @@ class Camera3Device :
                 sp<HalInterface> /*interface*/,
                 const Vector<int32_t>& /*sessionParamKeys*/,
                 bool /*useHalBufManager*/,
-                bool /*supportCameraMute*/) = 0;
+                bool /*supportCameraMute*/,
+                bool /*overrideToPortrait*/) = 0;
 
     sp<RequestThread> mRequestThread;
 
@@ -1341,6 +1348,10 @@ class Camera3Device :
     // Whether the camera framework overrides the device characteristics for
     // performance class.
     bool mOverrideForPerfClass;
+
+    // Whether the camera framework overrides the device characteristics for
+    // app compatibility reasons.
+    bool mOverrideToPortrait;
 
     // The current minimum expected frame duration based on AE_TARGET_FPS_RANGE
     nsecs_t mMinExpectedDuration = 0;

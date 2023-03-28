@@ -14,6 +14,40 @@
  * limitations under the License.
  */
 
+/* Changes from Qualcomm Innovation Center are provided under the following license:
+ * Copyright (c) 2022 Qualcomm Innovation Center, Inc. All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted (subject to the limitations in the
+ * disclaimer below) provided that the following conditions are met:
+ *
+ *   * Redistributions of source code must retain the above copyright
+ *     notice, this list of conditions and the following disclaimer.
+ *
+ *   * Redistributions in binary form must reproduce the above
+ *     copyright notice, this list of conditions and the following
+ *     disclaimer in the documentation and/or other materials provided
+ *     with the distribution.
+ *
+ *   * Neither the name of Qualcomm Innovation Center, Inc. nor the names of its
+ *     contributors may be used to endorse or promote products derived
+ *     from this software without specific prior written permission.
+ *
+ * NO EXPRESS OR IMPLIED LICENSES TO ANY PARTY'S PATENT RIGHTS ARE
+ * GRANTED BY THIS LICENSE. THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT
+ * HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED
+ * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+ * IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE
+ * GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER
+ * IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
+ * OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN
+ * IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
 #define LOG_TAG "Camera3-Device"
 #define ATRACE_TAG ATRACE_TAG_CAMERA
 //#define LOG_NDEBUG 0
@@ -23,6 +57,13 @@
 #define ALOGVV(...) ALOGV(__VA_ARGS__)
 #else
 #define ALOGVV(...) ((void)0)
+#endif
+
+#ifdef USES_OPLUS_CAMERA
+#define TAG_NAME "com.oplus.packageName"
+#endif
+#ifdef USES_NOTHING_CAMERA
+#define TAG_NAME "com.nothing.device.package_name"
 #endif
 
 // Convenience macro for transient errors
@@ -73,7 +114,8 @@ using namespace android::hardware::camera;
 
 namespace android {
 
-Camera3Device::Camera3Device(const String8 &id, bool overrideForPerfClass, bool legacyClient):
+Camera3Device::Camera3Device(const String8 &id, bool overrideForPerfClass, bool overrideToPortrait,
+        bool legacyClient):
         mId(id),
         mLegacyClient(legacyClient),
         mOperatingMode(NO_MODE),
@@ -94,7 +136,8 @@ Camera3Device::Camera3Device(const String8 &id, bool overrideForPerfClass, bool 
         mVendorTagId(CAMERA_METADATA_INVALID_VENDOR_ID),
         mLastTemplateId(-1),
         mNeedFixupMonochromeTags(false),
-        mOverrideForPerfClass(overrideForPerfClass)
+        mOverrideForPerfClass(overrideForPerfClass),
+        mOverrideToPortrait(overrideToPortrait)
 {
     ATRACE_CALL();
     ALOGV("%s: Created device for camera %s", __FUNCTION__, mId.string());
@@ -166,7 +209,7 @@ status_t Camera3Device::initializeCommonLocked() {
     /** Start up request queue thread */
     mRequestThread = createNewRequestThread(
             this, mStatusTracker, mInterface, sessionParamKeys,
-            mUseHalBufManager, mSupportCameraMute);
+            mUseHalBufManager, mSupportCameraMute, mOverrideToPortrait);
     res = mRequestThread->run(String8::format("C3Dev-%s-ReqQueue", mId.string()).string());
     if (res != OK) {
         SET_ERR_L("Unable to start request queue thread: %s (%d)",
@@ -260,20 +303,28 @@ status_t Camera3Device::disconnectImpl() {
             Mutex::Autolock l(mLock);
             if (mStatus == STATUS_UNINITIALIZED) return res;
 
-            if (mStatus == STATUS_ACTIVE ||
-                    (mStatus == STATUS_ERROR && mRequestThread != NULL)) {
-                res = mRequestThread->clearRepeatingRequests();
-                if (res != OK) {
-                    SET_ERR_L("Can't stop streaming");
-                    // Continue to close device even in case of error
-                } else {
-                    res = waitUntilStateThenRelock(/*active*/ false, maxExpectedDuration);
+            if (mRequestThread != NULL) {
+                if (mStatus == STATUS_ACTIVE || mStatus == STATUS_ERROR) {
+                    res = mRequestThread->clear();
                     if (res != OK) {
-                        SET_ERR_L("Timeout waiting for HAL to drain (% " PRIi64 " ns)",
-                                maxExpectedDuration);
+                        SET_ERR_L("Can't stop streaming");
                         // Continue to close device even in case of error
+                    } else {
+                        res = waitUntilStateThenRelock(/*active*/ false, maxExpectedDuration);
+                        if (res != OK) {
+                            SET_ERR_L("Timeout waiting for HAL to drain (% " PRIi64 " ns)",
+                                    maxExpectedDuration);
+                            // Continue to close device even in case of error
+                        }
                     }
                 }
+                // Signal to request thread that we're not expecting any
+                // more requests. This will be true since once we're in
+                // disconnect and we've cleared off the request queue, the
+                // request thread can't receive any new requests through
+                // binder calls - since disconnect holds
+                // mBinderSerialization lock.
+                mRequestThread->setRequestClearing();
             }
 
             if (mStatus == STATUS_ERROR) {
@@ -427,6 +478,29 @@ ssize_t Camera3Device::getJpegBufferSize(const CameraMetadata &info, uint32_t wi
     }
     maxJpegBufferSize = jpegBufMaxSize.data.i32[0];
 
+    uint32_t tag = 0;
+    ssize_t jpegDebugSize = 0;
+    sp<VendorTagDescriptor> vTags;
+    sp<VendorTagDescriptorCache> cache = VendorTagDescriptorCache::getGlobalVendorTagCache();
+    if (NULL != cache.get()) {
+        metadata_vendor_id_t vendorId;
+        status_t res = info.getVendorId(&vendorId);
+        if (res == OK) {
+            cache->getVendorTagDescriptor(vendorId, &vTags);
+        }
+    }
+
+    if (NULL != vTags.get()) {
+        status_t res = CameraMetadata::getTagFromName("org.quic.camera.jpegdebugdata.size", vTags.get(), &tag);
+
+        if (res == OK) {
+            camera_metadata_ro_entry jpegdebugdatasize = info.find(tag);
+            if (jpegdebugdatasize.count != 0) {
+                jpegDebugSize = jpegdebugdatasize.data.i32[0];
+                ALOGE("%s: Camera %s: Jpeg debug data size %zd", __FUNCTION__, mId.string(), jpegDebugSize);
+            }
+        }
+    }
     camera3::Size chosenMaxJpegResolution = maxDefaultJpegResolution;
     if (useMaxSensorPixelModeThreshold) {
         maxJpegBufferSize =
@@ -436,11 +510,12 @@ ssize_t Camera3Device::getJpegBufferSize(const CameraMetadata &info, uint32_t wi
     }
     assert(kMinJpegBufferSize < maxJpegBufferSize);
 
+    ssize_t minJpegBufferSize = kMinJpegBufferSize + jpegDebugSize;
     // Calculate final jpeg buffer size for the given resolution.
     float scaleFactor = ((float) (width * height)) /
             (chosenMaxJpegResolution.width * chosenMaxJpegResolution.height);
-    ssize_t jpegBufferSize = scaleFactor * (maxJpegBufferSize - kMinJpegBufferSize) +
-            kMinJpegBufferSize;
+    ssize_t jpegBufferSize = scaleFactor * (maxJpegBufferSize - minJpegBufferSize) +
+            minJpegBufferSize;
     return jpegBufferSize;
 }
 
@@ -2287,6 +2362,27 @@ status_t Camera3Device::configureStreamsLocked(int operatingMode,
         return BAD_VALUE;
     }
 
+#ifdef TAG_NAME
+    sp<VendorTagDescriptor> vTags;
+    sp<VendorTagDescriptorCache> vCache = VendorTagDescriptorCache::getGlobalVendorTagCache();
+    if (vCache.get()) {
+        const camera_metadata_t *metaBuffer = sessionParams.getAndLock();
+        metadata_vendor_id_t vendorId = get_camera_metadata_vendor_id(metaBuffer);
+        sessionParams.unlock(metaBuffer);
+        vCache->getVendorTagDescriptor(vendorId, &vTags);
+        uint32_t tag;
+        if (CameraMetadata::getTagFromName(TAG_NAME, vTags.get(), &tag)) {
+            ALOGE("%s: Unable to get %s tag", __FUNCTION__, TAG_NAME);
+        } else {
+            std::string pkgName = CameraService::getCurrPackageName();
+            status_t res = const_cast<CameraMetadata&>(sessionParams).update(tag, String8(pkgName.c_str()));
+            if (res) {
+                ALOGE("%s: metadata update failed, res = %d", __FUNCTION__, res);
+            }
+        }
+    }
+#endif
+
     bool isConstrainedHighSpeed =
             CAMERA_STREAM_CONFIGURATION_CONSTRAINED_HIGH_SPEED_MODE == operatingMode;
 
@@ -2879,7 +2975,8 @@ Camera3Device::RequestThread::RequestThread(wp<Camera3Device> parent,
         sp<StatusTracker> statusTracker,
         sp<HalInterface> interface, const Vector<int32_t>& sessionParamKeys,
         bool useHalBufManager,
-        bool supportCameraMute) :
+        bool supportCameraMute,
+        bool overrideToPortrait) :
         Thread(/*canCallJava*/false),
         mParent(parent),
         mStatusTracker(statusTracker),
@@ -2908,7 +3005,8 @@ Camera3Device::RequestThread::RequestThread(wp<Camera3Device> parent,
         mSessionParamKeys(sessionParamKeys),
         mLatestSessionParams(sessionParamKeys.size()),
         mUseHalBufManager(useHalBufManager),
-        mSupportCameraMute(supportCameraMute){
+        mSupportCameraMute(supportCameraMute),
+        mOverrideToPortrait(overrideToPortrait) {
     mStatusId = statusTracker->addComponent("RequestThread");
 }
 
@@ -3052,7 +3150,8 @@ status_t Camera3Device::RequestThread::clearRepeatingRequests(/*out*/int64_t *la
 
 }
 
-status_t Camera3Device::RequestThread::clearRepeatingRequestsLocked(/*out*/int64_t *lastFrameNumber) {
+status_t Camera3Device::RequestThread::clearRepeatingRequestsLocked(
+        /*out*/int64_t *lastFrameNumber) {
     std::vector<int32_t> streamIds;
     for (const auto& request : mRepeatingRequests) {
         for (const auto& stream : request->mOutputStreams) {
@@ -3076,8 +3175,6 @@ status_t Camera3Device::RequestThread::clear(
     ATRACE_CALL();
     Mutex::Autolock l(mRequestLock);
     ALOGV("RequestThread::%s:", __FUNCTION__);
-
-    mRepeatingRequests.clear();
 
     // Send errors for all requests pending in the request queue, including
     // pending repeating requests
@@ -3116,10 +3213,7 @@ status_t Camera3Device::RequestThread::clear(
 
     Mutex::Autolock al(mTriggerMutex);
     mTriggerMap.clear();
-    if (lastFrameNumber != NULL) {
-        *lastFrameNumber = mRepeatingLastFrameNumber;
-    }
-    mRepeatingLastFrameNumber = hardware::camera2::ICameraDeviceUser::NO_IN_FLIGHT_REPEATING_FRAMES;
+    clearRepeatingRequestsLocked(lastFrameNumber);
     mRequestClearing = true;
     mRequestSignal.signal();
     return OK;
@@ -3583,9 +3677,9 @@ status_t Camera3Device::RequestThread::prepareHalRequests() {
         mPrevTriggers = triggerCount;
 
         // Do not override rotate&crop for stream configurations that include
-        // SurfaceViews(HW_COMPOSER) output. The display rotation there will be
-        // compensated by NATIVE_WINDOW_TRANSFORM_INVERSE_DISPLAY
-        bool rotateAndCropChanged = mComposerOutput ? false :
+        // SurfaceViews(HW_COMPOSER) output, unless mOverrideToPortrait is set.
+        // The display rotation there will be compensated by NATIVE_WINDOW_TRANSFORM_INVERSE_DISPLAY
+        bool rotateAndCropChanged = (mComposerOutput && !mOverrideToPortrait) ? false :
             overrideAutoRotateAndCrop(captureRequest);
         bool testPatternChanged = overrideTestPattern(captureRequest);
 
@@ -4237,6 +4331,11 @@ void Camera3Device::RequestThread::waitForNextRequestBatch() {
     return;
 }
 
+void Camera3Device::RequestThread::setRequestClearing() {
+    Mutex::Autolock l(mRequestLock);
+    mRequestClearing = true;
+}
+
 sp<Camera3Device::CaptureRequest>
         Camera3Device::RequestThread::waitForNextRequestLocked() {
     status_t res;
@@ -4625,6 +4724,15 @@ status_t Camera3Device::RequestThread::addFakeTriggerIds(
 bool Camera3Device::RequestThread::overrideAutoRotateAndCrop(
         const sp<CaptureRequest> &request) {
     ATRACE_CALL();
+
+    if (mOverrideToPortrait) {
+        Mutex::Autolock l(mTriggerMutex);
+        uint8_t rotateAndCrop_u8 = mRotateAndCropOverride;
+        CameraMetadata &metadata = request->mSettingsList.begin()->metadata;
+        metadata.update(ANDROID_SCALER_ROTATE_AND_CROP,
+                &rotateAndCrop_u8, 1);
+        return true;
+    }
 
     if (request->mRotateAndCropAuto) {
         Mutex::Autolock l(mTriggerMutex);
