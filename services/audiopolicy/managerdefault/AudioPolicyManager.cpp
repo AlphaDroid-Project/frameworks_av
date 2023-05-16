@@ -3248,9 +3248,16 @@ audio_io_handle_t AudioPolicyManager::selectOutputForMusicEffects()
     }
 
     if (output != mMusicEffectOutput) {
-        mEffects.moveEffects(AUDIO_SESSION_OUTPUT_MIX, mMusicEffectOutput, output);
-        mpClientInterface->moveEffects(AUDIO_SESSION_OUTPUT_MIX, mMusicEffectOutput, output);
-        mMusicEffectOutput = output;
+        if (mpClientInterface->moveEffects(
+                                      AUDIO_SESSION_OUTPUT_MIX,
+                                      mMusicEffectOutput, output) != NO_ERROR
+            && mOutputs.valueFor(output)->isDuplicated()) {
+            ALOGW("gloabl effect do not support duplicating thread");
+            output = AUDIO_IO_HANDLE_NONE;
+        } else {
+            mEffects.moveEffects(AUDIO_SESSION_OUTPUT_MIX, mMusicEffectOutput, output);
+            mMusicEffectOutput = output;
+        }
     }
 
     ALOGV("selectOutputForMusicEffects selected output %d", output);
@@ -5630,7 +5637,9 @@ status_t AudioPolicyManager::initialize() {
         }
     }
 
-    mEngine->updateDeviceSelectionCache();
+    // The actual device selection cache will be updated when calling `updateDevicesAndOutputs`
+    // at the end of this function.
+    mEngine->initializeDeviceSelectionCache();
     mCommunnicationStrategy = mEngine->getProductStrategyForAttributes(
         mEngine->getAttributesForStreamType(AUDIO_STREAM_VOICE_CALL));
 
@@ -7336,7 +7345,8 @@ status_t AudioPolicyManager::checkAndSetVolume(IVolumeCurves &curves,
     // if sco and call follow same curves, bypass forceUseForComm
     if ((callVolSrc != btScoVolSrc) &&
             ((isVoiceVolSrc && isScoRequested) ||
-             (isBtScoVolSrc && !(isScoRequested || isHAUsed)))) {
+             (isBtScoVolSrc && !(isScoRequested || isHAUsed))) &&
+            !isSingleDeviceType(deviceTypes, AUDIO_DEVICE_OUT_TELEPHONY_TX)) {
         ALOGV("%s cannot set volume group %d volume when is%srequested for comm", __func__,
              volumeSource, isScoRequested ? " " : " not ");
         // Do not return an error here as AudioService will always set both voice call

@@ -2852,6 +2852,9 @@ bool AudioFlinger::PlaybackThread::destroyTrack_l(const sp<Track>& track)
     if (!trackActive) {
         removeTrack_l(track);
     } else if (track->isFastTrack() || track->isOffloaded() || track->isDirect()) {
+        if (track->isPausePending()) {
+            track->pauseAck();
+        }
         track->mState = TrackBase::STOPPING_1;
     }
 
@@ -3327,7 +3330,7 @@ bool AudioFlinger::PlaybackThread::isValidSyncEvent(const sp<SyncEvent>& event) 
 }
 
 void AudioFlinger::PlaybackThread::threadLoop_removeTracks(
-        const Vector< sp<Track> >& tracksToRemove)
+        [[maybe_unused]] const Vector< sp<Track> >& tracksToRemove)
 {
     // Miscellaneous track cleanup when removed from the active list,
     // called without Thread lock but synchronized with threadLoop processing.
@@ -3338,8 +3341,6 @@ void AudioFlinger::PlaybackThread::threadLoop_removeTracks(
             addBatteryData(IMediaPlayerService::kBatteryDataAudioFlingerStop);
         }
     }
-#else
-    (void)tracksToRemove; // suppress unused warning
 #endif
 }
 
@@ -5866,7 +5867,7 @@ AudioFlinger::PlaybackThread::mixer_state AudioFlinger::MixerThread::prepareTrac
     }
 
     // Push the new FastMixer state if necessary
-    bool pauseAudioWatchdog = false;
+    [[maybe_unused]] bool pauseAudioWatchdog = false;
     if (didModify) {
         state->mFastTracksGen++;
         // if the fast mixer was active, but now there are no fast tracks, then put it in cold idle
@@ -6232,12 +6233,17 @@ void AudioFlinger::DirectOutputThread::processVolume_l(Track *track, bool lastTr
         if (left > GAIN_FLOAT_UNITY) {
             left = GAIN_FLOAT_UNITY;
         }
-        left *= v * mMasterBalanceLeft; // DirectOutputThread balance applied as track volume
         right = float_from_gain(gain_minifloat_unpack_right(vlr));
         if (right > GAIN_FLOAT_UNITY) {
             right = GAIN_FLOAT_UNITY;
         }
-        right *= v * mMasterBalanceRight;
+        left *= v;
+        right *= v;
+        if (mAudioFlinger->getMode() != AUDIO_MODE_IN_COMMUNICATION
+                || audio_channel_count_from_out_mask(mChannelMask) > 1) {
+            left *= mMasterBalanceLeft; // DirectOutputThread balance applied as track volume
+            right *= mMasterBalanceRight;
+        }
     }
 
     if (lastTrack) {
@@ -6275,7 +6281,8 @@ void AudioFlinger::DirectOutputThread::onAddNewTrack_l()
                 mFlushPending = true;
             }
         } else /* mType == OFFLOAD */ {
-            if (previousTrack->sessionId() != latestTrack->sessionId()) {
+            if (previousTrack->sessionId() != latestTrack->sessionId() ||
+                previousTrack->isFlushPending()) {
                 mFlushPending = true;
             }
         }
@@ -7593,7 +7600,7 @@ AudioFlinger::RecordThread::RecordThread(const sp<AudioFlinger>& audioFlinger,
     size_t numCounterOffers = 0;
     const NBAIO_Format offers[1] = {Format_from_SR_C(mSampleRate, mChannelCount, mFormat)};
 #if !LOG_NDEBUG
-    ssize_t index =
+    [[maybe_unused]] ssize_t index =
 #else
     (void)
 #endif
@@ -7643,7 +7650,7 @@ AudioFlinger::RecordThread::RecordThread(const sp<AudioFlinger>& audioFlinger,
         Pipe *pipe = new Pipe(pipeFramesP2, format, pipeBuffer);
         const NBAIO_Format offers[1] = {format};
         size_t numCounterOffers = 0;
-        ssize_t index = pipe->negotiate(offers, 1, NULL, numCounterOffers);
+        [[maybe_unused]] ssize_t index = pipe->negotiate(offers, 1, NULL, numCounterOffers);
         ALOG_ASSERT(index == 0);
         mPipeSink = pipe;
         PipeReader *pipeReader = new PipeReader(*pipe);
@@ -9099,7 +9106,8 @@ bool AudioFlinger::RecordThread::checkForNewParameter_l(const String8& keyValueP
     audio_format_t reqFormat = mFormat;
     uint32_t samplingRate = mSampleRate;
     // TODO this may change if we want to support capture from HDMI PCM multi channel (e.g on TVs).
-    audio_channel_mask_t channelMask = audio_channel_in_mask_from_count(mChannelCount);
+    [[maybe_unused]] audio_channel_mask_t channelMask =
+                                audio_channel_in_mask_from_count(mChannelCount);
 
     AudioParameter param = AudioParameter(keyValuePair);
     int value;

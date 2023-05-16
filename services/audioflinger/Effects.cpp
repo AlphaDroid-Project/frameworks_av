@@ -569,7 +569,8 @@ AudioFlinger::EffectModule::EffectModule(const sp<AudioFlinger::EffectCallbackIn
       mMaxDisableWaitCnt(1), // set by configure(), should be >= 1
       mDisableWaitCnt(0),    // set by process() and updateState()
       mOffloaded(false),
-      mAddedToHal(false)
+      mAddedToHal(false),
+      mIsOutput(false)
 #ifdef FLOAT_EFFECT_CHAIN
       , mSupportsFloat(false)
 #endif
@@ -962,6 +963,7 @@ status_t AudioFlinger::EffectModule::configure()
     mConfig.outputCfg.mask = EFFECT_CONFIG_ALL;
     mConfig.inputCfg.buffer.frameCount = callback->frameCount();
     mConfig.outputCfg.buffer.frameCount = mConfig.inputCfg.buffer.frameCount;
+    mIsOutput = callback->isOutput();
 
     ALOGV("configure() %p chain %p buffer %p framecount %zu",
           this, callback->chain().promote().get(),
@@ -980,7 +982,7 @@ status_t AudioFlinger::EffectModule::configure()
 
 #ifdef MULTICHANNEL_EFFECT_CHAIN
     if (status != NO_ERROR &&
-            callback->isOutput() &&
+            mIsOutput &&
             (mConfig.inputCfg.channels != AUDIO_CHANNEL_OUT_STEREO
                     || mConfig.outputCfg.channels != AUDIO_CHANNEL_OUT_STEREO)) {
         // Older effects may require exact STEREO position mask.
@@ -1643,6 +1645,22 @@ status_t AudioFlinger::EffectModule::setVibratorInfo(const media::AudioVibratorI
     return status;
 }
 
+status_t AudioFlinger::EffectModule::getConfigs(
+        audio_config_base_t* inputCfg, audio_config_base_t* outputCfg, bool* isOutput) const {
+    Mutex::Autolock _l(mLock);
+    if (mConfig.inputCfg.mask == 0 || mConfig.outputCfg.mask == 0) {
+        return NO_INIT;
+    }
+    inputCfg->sample_rate = mConfig.inputCfg.samplingRate;
+    inputCfg->channel_mask = static_cast<audio_channel_mask_t>(mConfig.inputCfg.channels);
+    inputCfg->format = static_cast<audio_format_t>(mConfig.inputCfg.format);
+    outputCfg->sample_rate = mConfig.outputCfg.samplingRate;
+    outputCfg->channel_mask = static_cast<audio_channel_mask_t>(mConfig.outputCfg.channels);
+    outputCfg->format = static_cast<audio_format_t>(mConfig.outputCfg.format);
+    *isOutput = mIsOutput;
+    return NO_ERROR;
+}
+
 static std::string dumpInOutBuffer(bool isInput, const sp<EffectBufferHalInterface> &buffer) {
     std::stringstream ss;
 
@@ -1761,6 +1779,7 @@ BINDER_METHOD_ENTRY(disable) \
 BINDER_METHOD_ENTRY(command) \
 BINDER_METHOD_ENTRY(disconnect) \
 BINDER_METHOD_ENTRY(getCblk) \
+BINDER_METHOD_ENTRY(getConfig) \
 
 // singleton for Binder Method Statistics for IEffect
 mediautils::MethodStatistics<int>& getIEffectStatistics() {
@@ -1803,6 +1822,13 @@ status_t AudioFlinger::EffectHandle::initCheck()
 #define RETURN(code) \
   *_aidl_return = (code); \
   return Status::ok();
+
+#define VALUE_OR_RETURN_STATUS_AS_OUT(exp)              \
+    ({                                                  \
+        auto _tmp = (exp);                              \
+        if (!_tmp.ok()) { RETURN(_tmp.error()); }       \
+        std::move(_tmp.value());                        \
+    })
 
 Status AudioFlinger::EffectHandle::enable(int32_t* _aidl_return)
 {
@@ -1913,6 +1939,32 @@ void AudioFlinger::EffectHandle::disconnect(bool unpinIfLast)
 Status AudioFlinger::EffectHandle::getCblk(media::SharedFileRegion* _aidl_return) {
     LOG_ALWAYS_FATAL_IF(!convertIMemoryToSharedFileRegion(mCblkMemory, _aidl_return));
     return Status::ok();
+}
+
+Status AudioFlinger::EffectHandle::getConfig(
+        media::EffectConfig* _config, int32_t* _aidl_return) {
+    AutoMutex _l(mLock);
+    sp<EffectBase> effect = mEffect.promote();
+    if (effect == nullptr || mDisconnected) {
+        RETURN(DEAD_OBJECT);
+    }
+    sp<EffectModule> effectModule = effect->asEffectModule();
+    if (effectModule == nullptr) {
+        RETURN(INVALID_OPERATION);
+    }
+    audio_config_base_t inputCfg = AUDIO_CONFIG_BASE_INITIALIZER;
+    audio_config_base_t outputCfg = AUDIO_CONFIG_BASE_INITIALIZER;
+    bool isOutput;
+    status_t status = effectModule->getConfigs(&inputCfg, &outputCfg, &isOutput);
+    if (status == NO_ERROR) {
+        constexpr bool isInput = false; // effects always use 'OUT' channel masks.
+        _config->inputCfg = VALUE_OR_RETURN_STATUS_AS_OUT(
+                legacy2aidl_audio_config_base_t_AudioConfigBase(inputCfg, isInput));
+        _config->outputCfg = VALUE_OR_RETURN_STATUS_AS_OUT(
+                legacy2aidl_audio_config_base_t_AudioConfigBase(outputCfg, isInput));
+        _config->isOnInputStream = !isOutput;
+    }
+    RETURN(status);
 }
 
 Status AudioFlinger::EffectHandle::command(int32_t cmdCode,
@@ -3286,8 +3338,18 @@ status_t AudioFlinger::DeviceEffectProxy::checkPort(const PatchPanel::Patch& pat
     ALOGV("%s type %d device type %d address %s device ID %d patch.isSoftware() %d",
             __func__, port->type, port->ext.device.type,
             port->ext.device.address, port->id, patch.isSoftware());
-    if (port->type != AUDIO_PORT_TYPE_DEVICE || port->ext.device.type != mDevice.mType
-        || port->ext.device.address != mDevice.address()) {
+    if (port->type != AUDIO_PORT_TYPE_DEVICE || port->ext.device.type != mDevice.mType ||
+        port->ext.device.address != mDevice.address()) {
+        return NAME_NOT_FOUND;
+    }
+    if (((mDescriptor.flags & EFFECT_FLAG_TYPE_MASK) == EFFECT_FLAG_TYPE_POST_PROC) &&
+        (audio_port_config_has_input_direction(port))) {
+        ALOGI("%s don't create postprocessing effect on record port", __func__);
+        return NAME_NOT_FOUND;
+    }
+    if (((mDescriptor.flags & EFFECT_FLAG_TYPE_MASK) == EFFECT_FLAG_TYPE_PRE_PROC) &&
+        (!audio_port_config_has_input_direction(port))) {
+        ALOGI("%s don't create preprocessing effect on playback port", __func__);
         return NAME_NOT_FOUND;
     }
     status_t status = NAME_NOT_FOUND;
@@ -3318,12 +3380,20 @@ status_t AudioFlinger::DeviceEffectProxy::checkPort(const PatchPanel::Patch& pat
     } else if (patch.isSoftware() || patch.thread().promote() != nullptr) {
         sp <ThreadBase> thread;
         if (audio_port_config_has_input_direction(port)) {
+            if ((mDescriptor.flags & EFFECT_FLAG_TYPE_MASK) == EFFECT_FLAG_TYPE_POST_PROC) {
+                ALOGI("%s don't create postprocessing effect on record thread", __func__);
+                return NAME_NOT_FOUND;
+            }
             if (patch.isSoftware()) {
                 thread = patch.mRecord.thread();
             } else {
                 thread = patch.thread().promote();
             }
         } else {
+            if ((mDescriptor.flags & EFFECT_FLAG_TYPE_MASK) == EFFECT_FLAG_TYPE_PRE_PROC) {
+                ALOGI("%s don't create preprocessing effect on playback thread", __func__);
+                return NAME_NOT_FOUND;
+            }
             if (patch.isSoftware()) {
                 thread = patch.mPlayback.thread();
             } else {
@@ -3339,6 +3409,7 @@ status_t AudioFlinger::DeviceEffectProxy::checkPort(const PatchPanel::Patch& pat
     } else {
         status = BAD_VALUE;
     }
+
     if (status == NO_ERROR || status == ALREADY_EXISTS) {
         Status bs;
         if (isEnabled()) {

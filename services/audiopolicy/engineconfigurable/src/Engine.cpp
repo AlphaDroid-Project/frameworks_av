@@ -93,7 +93,7 @@ status_t Engine::initCheck()
 template <typename Key>
 Element<Key> *Engine::getFromCollection(const Key &key) const
 {
-    const Collection<Key> collection = getCollection<Key>();
+    const Collection<Key> &collection = getCollection<Key>();
     return collection.get(key);
 }
 
@@ -352,14 +352,6 @@ sp<DeviceDescriptor> Engine::getInputDeviceForAttributes(const audio_attributes_
         }
     }
     return availableInputDevices.getDevice(deviceType, String8(address.c_str()), AUDIO_FORMAT_DEFAULT);
-}
-
-void Engine::updateDeviceSelectionCache()
-{
-    for (const auto &iter : getProductStrategies()) {
-        const auto &strategy = iter.second;
-        mDevicesForStrategies[strategy->getId()] = getDevicesForProductStrategy(strategy->getId());
-    }
 }
 
 void Engine::setDeviceAddressForProductStrategy(product_strategy_t strategy,
