@@ -82,6 +82,10 @@
 #include <vendor/oneplus/hardware/camera/1.0/IOnePlusCameraProvider.h>
 #endif
 
+#ifdef CAMERA_NEEDS_CLIENT_INFO_LIB_OPLUS
+#include <vendor/oplus/hardware/cameraMDM/2.0/IOPlusCameraMDM.h>
+#endif
+
 namespace {
     const char* kPermissionServiceName = "permission";
 }; // namespace anonymous
@@ -101,6 +105,9 @@ using hardware::camera2::utils::CameraIdAndSessionConfiguration;
 using hardware::camera2::utils::ConcurrentCameraIdCombination;
 #ifdef CAMERA_NEEDS_CLIENT_INFO_LIB
 using ::vendor::oneplus::hardware::camera::V1_0::IOnePlusCameraProvider;
+#endif
+#ifdef CAMERA_NEEDS_CLIENT_INFO_LIB_OPLUS
+using ::vendor::oplus::hardware::cameraMDM::V2_0::IOPlusCameraMDM;
 #endif
 
 // ----------------------------------------------------------------------------
@@ -141,6 +148,9 @@ static const String16
 const char *sFileName = "lastOpenSessionDumpFile";
 #ifdef CAMERA_NEEDS_CLIENT_INFO_LIB
 static const sp<IOnePlusCameraProvider> gVendorCameraProviderService = IOnePlusCameraProvider::getService();
+#endif
+#ifdef CAMERA_NEEDS_CLIENT_INFO_LIB_OPLUS
+static const sp<IOPlusCameraMDM> gVendorCameraProviderService = IOPlusCameraMDM::getService();
 #endif
 static constexpr int32_t kSystemNativeClientScore = resource_policy::PERCEPTIBLE_APP_ADJ;
 static constexpr int32_t kSystemNativeClientState =
@@ -3562,7 +3572,7 @@ status_t CameraService::BasicClient::startCameraOps() {
     // Notify listeners of camera open/close status
     sCameraService->updateOpenCloseStatus(mCameraIdStr, true/*open*/, mClientPackageName);
 
-#ifdef CAMERA_NEEDS_CLIENT_INFO_LIB
+#if defined (CAMERA_NEEDS_CLIENT_INFO_LIB) || defined (CAMERA_NEEDS_CLIENT_INFO_LIB_OPLUS)
     gVendorCameraProviderService->setPackageName(String8(mClientPackageName).string());
 #endif
 
@@ -3738,8 +3748,7 @@ void CameraService::BasicClient::block() {
 // ----------------------------------------------------------------------------
 
 void CameraService::Client::notifyError(int32_t errorCode,
-        const CaptureResultExtras& resultExtras) {
-    (void) resultExtras;
+        [[maybe_unused]] const CaptureResultExtras& resultExtras) {
     if (mRemoteCallback != NULL) {
         int32_t api1ErrorCode = CAMERA_ERROR_RELEASED;
         if (errorCode == hardware::camera2::ICameraDeviceCallbacks::ERROR_CAMERA_DISABLED) {

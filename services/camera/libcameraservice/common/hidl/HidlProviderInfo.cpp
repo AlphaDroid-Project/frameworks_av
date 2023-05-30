@@ -442,8 +442,7 @@ hardware::Return<void> HidlProviderInfo::torchModeStatusChange(
 }
 
 void HidlProviderInfo::serviceDied(uint64_t cookie,
-        const wp<hidl::base::V1_0::IBase>& who) {
-    (void) who;
+        [[maybe_unused]] const wp<hidl::base::V1_0::IBase>& who) {
     ALOGI("Camera provider '%s' has died; removing it", mProviderInstance.c_str());
     if (cookie != mId) {
         ALOGW("%s: Unexpected serviceDied cookie %" PRIu64 ", expected %" PRIu32,
@@ -693,6 +692,11 @@ HidlProviderInfo::HidlDeviceInfo3::HidlDeviceInfo3(
 
     mTorchStrengthLevel = 0;
 
+    if (!kEnableLazyHal) {
+        // Save HAL reference indefinitely
+        mSavedInterface = interface;
+    }
+
     queryPhysicalCameraIds();
 
     // Get physical camera characteristics if applicable
@@ -753,13 +757,6 @@ HidlProviderInfo::HidlDeviceInfo3::HidlDeviceInfo3(
             }
         }
     }
-
-    if (!kEnableLazyHal) {
-        // Save HAL reference indefinitely
-        mSavedInterface = interface;
-    }
-
-
 }
 
 status_t HidlProviderInfo::HidlDeviceInfo3::setTorchMode(bool enabled) {
