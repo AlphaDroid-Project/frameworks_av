@@ -1084,7 +1084,12 @@ audio_io_handle_t AudioPolicyManager::getOutput(audio_stream_type_t stream)
     // and AudioSystem::getOutputSamplingRate().
 
     SortedVector<audio_io_handle_t> outputs = getOutputsForDevices(devices, mOutputs);
-    const audio_io_handle_t output = selectOutput(outputs);
+    audio_output_flags_t flags = AUDIO_OUTPUT_FLAG_NONE;
+    if (stream == AUDIO_STREAM_MUSIC &&
+        property_get_bool("audio.deep_buffer.media", false /* default_value */)) {
+        flags = AUDIO_OUTPUT_FLAG_DEEP_BUFFER;
+    }
+    const audio_io_handle_t output = selectOutput(outputs, flags);
 
     ALOGV("getOutput() stream %d selected devices %s, output %d", stream,
           devices.toString().c_str(), output);
@@ -2002,6 +2007,10 @@ status_t AudioPolicyManager::startOutput(audio_port_handle_t portId)
         outputDesc->stop();
         return status;
     }
+    if (client->hasPreferredDevice()) {
+        // playback activity with preferred device impacts routing occurred, inform upper layers
+        mpClientInterface->onRoutingUpdated();
+    }
     if (delayMs != 0) {
         usleep(delayMs * 1000);
     }
@@ -2084,8 +2093,7 @@ status_t AudioPolicyManager::startSource(const sp<SwAudioOutputDescriptor>& outp
     outputDesc->setClientActive(client, true);
 
     if (client->hasPreferredDevice(true)) {
-        if (outputDesc->clientsList(true /*activeOnly*/).size() == 1 &&
-                client->isPreferredDeviceForExclusiveUse()) {
+        if (outputDesc->sameExclusivePreferredDevicesCount() > 0) {
             // Preferred device may be exclusive, use only if no other active clients on this output
             devices = DeviceVector(
                         mAvailableOutputDevices.getDeviceFromId(client->preferredDeviceId()));
@@ -2247,6 +2255,11 @@ status_t AudioPolicyManager::stopOutput(audio_port_handle_t portId)
     }
     sp<TrackClientDescriptor> client = outputDesc->getClient(portId);
 
+    if (client->hasPreferredDevice(true)) {
+        // playback activity with preferred device impacts routing occurred, inform upper layers
+        mpClientInterface->onRoutingUpdated();
+    }
+
     ALOGV("stopOutput() output %d, stream %d, session %d",
           outputDesc->mIoHandle, client->stream(), client->session());
 
@@ -2284,7 +2297,8 @@ status_t AudioPolicyManager::stopSource(const sp<SwAudioOutputDescriptor>& outpu
             }
         }
         bool forceDeviceUpdate = false;
-        if (client->hasPreferredDevice(true)) {
+        if (client->hasPreferredDevice(true) &&
+                outputDesc->sameExclusivePreferredDevicesCount() < 2) {
             checkStrategyRoute(client->strategy(), AUDIO_IO_HANDLE_NONE);
             forceDeviceUpdate = true;
         }

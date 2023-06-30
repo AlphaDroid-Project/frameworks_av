@@ -2023,7 +2023,7 @@ status_t CameraProviderManager::ProviderInfo::dump(int fd, const Vector<String16
         }
         CameraMetadata info2;
         res = device->getCameraCharacteristics(true /*overrideForPerfClass*/, &info2,
-                /*overrideToPortrait*/true);
+                /*overrideToPortrait*/false);
         if (res == INVALID_OPERATION) {
             dprintf(fd, "  API2 not directly supported\n");
         } else if (res != OK) {
@@ -2374,8 +2374,8 @@ status_t CameraProviderManager::ProviderInfo::DeviceInfo3::getCameraCharacterist
     if (overrideToPortrait) {
         const auto &lensFacingEntry = characteristics->find(ANDROID_LENS_FACING);
         const auto &sensorOrientationEntry = characteristics->find(ANDROID_SENSOR_ORIENTATION);
+        uint8_t lensFacing = lensFacingEntry.data.u8[0];
         if (lensFacingEntry.count > 0 && sensorOrientationEntry.count > 0) {
-            uint8_t lensFacing = lensFacingEntry.data.u8[0];
             int32_t sensorOrientation = sensorOrientationEntry.data.i32[0];
             int32_t newSensorOrientation = sensorOrientation;
 
@@ -2396,6 +2396,8 @@ status_t CameraProviderManager::ProviderInfo::DeviceInfo3::getCameraCharacterist
         }
 
         if (characteristics->exists(ANDROID_INFO_DEVICE_STATE_ORIENTATIONS)) {
+            ALOGV("%s: Erasing ANDROID_INFO_DEVICE_STATE_ORIENTATIONS for lens facing %d",
+                    __FUNCTION__, lensFacing);
             characteristics->erase(ANDROID_INFO_DEVICE_STATE_ORIENTATIONS);
         }
     }
@@ -2431,8 +2433,8 @@ status_t CameraProviderManager::ProviderInfo::DeviceInfo3::filterSmallJpegSizes(
     for (size_t i = 0; i < streamConfigs.count; i += 4) {
         if ((streamConfigs.data.i32[i] == HAL_PIXEL_FORMAT_BLOB) && (streamConfigs.data.i32[i+3] ==
                 ANDROID_SCALER_AVAILABLE_STREAM_CONFIGURATIONS_OUTPUT)) {
-            if (streamConfigs.data.i32[i+1] < thresholdW  ||
-                    streamConfigs.data.i32[i+2] < thresholdH) {
+            if (streamConfigs.data.i32[i+1] * streamConfigs.data.i32[i+2] <
+                    thresholdW * thresholdH) {
                 continue;
             } else {
                 largeJpegCount ++;
@@ -2452,8 +2454,8 @@ status_t CameraProviderManager::ProviderInfo::DeviceInfo3::filterSmallJpegSizes(
             mCameraCharacteristics.find(ANDROID_SCALER_AVAILABLE_MIN_FRAME_DURATIONS);
     for (size_t i = 0; i < minDurations.count; i += 4) {
         if (minDurations.data.i64[i] == HAL_PIXEL_FORMAT_BLOB) {
-            if (minDurations.data.i64[i+1] < thresholdW ||
-                    minDurations.data.i64[i+2] < thresholdH) {
+            if ((int32_t)minDurations.data.i64[i+1] * (int32_t)minDurations.data.i64[i+2] <
+                    thresholdW * thresholdH) {
                 continue;
             } else {
                 largeJpegCount++;
@@ -2473,8 +2475,8 @@ status_t CameraProviderManager::ProviderInfo::DeviceInfo3::filterSmallJpegSizes(
             mCameraCharacteristics.find(ANDROID_SCALER_AVAILABLE_STALL_DURATIONS);
     for (size_t i = 0; i < stallDurations.count; i += 4) {
         if (stallDurations.data.i64[i] == HAL_PIXEL_FORMAT_BLOB) {
-            if (stallDurations.data.i64[i+1] < thresholdW ||
-                    stallDurations.data.i64[i+2] < thresholdH) {
+            if ((int32_t)stallDurations.data.i64[i+1] * (int32_t)stallDurations.data.i64[i+2] <
+                    thresholdW * thresholdH) {
                 continue;
             } else {
                 largeJpegCount++;
