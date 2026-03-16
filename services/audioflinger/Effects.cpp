@@ -45,6 +45,7 @@
 #include <system/audio_effects/effect_hapticgenerator.h>
 #include <system/audio_effects/effect_ns.h>
 #include <system/audio_effects/effect_spatializer.h>
+#include <system/audio_effects/effect_axionfx.h>
 #include <system/audio_effects/effect_visualizer.h>
 #include <utils/Log.h>
 
@@ -3002,6 +3003,9 @@ bool EffectChain::isEffectEligibleForSuspend(const effect_descriptor_t& desc)
          (memcmp(&desc.type, SL_IID_DAP_SW, sizeof(effect_uuid_t)) == 0) ||
          (memcmp(&desc.type, SL_V4A_RE, sizeof(effect_uuid_t)) == 0) ||
          (memcmp(&desc.type, SL_IID_DYNAMICSPROCESSING, sizeof(effect_uuid_t)) == 0))) {
+        return false;
+    }
+    if (memcmp(&desc.uuid, SL_IID_AXIONFX_IMPL, sizeof(effect_uuid_t)) == 0) {
         return false;
     }
     return true;

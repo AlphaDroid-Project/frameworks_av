@@ -17,6 +17,7 @@
 #define LOG_TAG "EffectsFactory"
 //#define LOG_NDEBUG 0
 
+#include <dlfcn.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -25,6 +26,7 @@
 #include <log/log.h>
 
 #include <media/EffectsFactoryApi.h>
+#include <system/audio_effects/effect_axionfx.h>
 
 #include "EffectsConfigLoader.h"
 #include "EffectsFactoryState.h"
@@ -57,6 +59,13 @@ static uint32_t updateNumEffects();
 static int findSubEffect(const effect_uuid_t *uuid,
                lib_entry_t **lib,
                effect_descriptor_t **desc);
+static void loadAxionFxEffect();
+
+static const char* kAxionFxLibPaths[] = {
+    "/vendor/lib64/soundfx/libaxionfx_legacy.so",
+    "/vendor/lib/soundfx/libaxionfx_legacy.so",
+    NULL
+};
 
 /////////////////////////////////////////////////
 //      Effect Control Interface functions
@@ -471,6 +480,8 @@ int init() {
         }
     }
 
+    loadAxionFxEffect();
+
     updateNumEffects();
     gInitDone = 1;
     ALOGV("init() done");
@@ -617,5 +628,111 @@ int EffectDumpEffects(int fd) {
                 gConfigNbElemSkipped);
     }
     return ret;
+}
+
+void loadAxionFxEffect() {
+    void *libHandle = NULL;
+    audio_effect_library_t *libDesc = NULL;
+    const char *libPath = NULL;
+
+    ALOGI("loadAxionFxEffect: attempting to load AxionFx");
+
+    for (int i = 0; kAxionFxLibPaths[i] != NULL; i++) {
+        ALOGI("loadAxionFxEffect: trying path %s, access=%d", kAxionFxLibPaths[i], access(kAxionFxLibPaths[i], R_OK));
+        if (access(kAxionFxLibPaths[i], R_OK) == 0) {
+            libHandle = dlopen(kAxionFxLibPaths[i], RTLD_NOW);
+            if (libHandle != NULL) {
+                libPath = kAxionFxLibPaths[i];
+                ALOGI("loadAxionFxEffect: loaded library from %s", libPath);
+                break;
+            }
+            ALOGW("loadAxionFxEffect: failed to dlopen %s: %s", kAxionFxLibPaths[i], dlerror());
+        }
+    }
+
+    if (libHandle == NULL) {
+        ALOGE("loadAxionFxEffect: AxionFx library not found, skipping");
+        return;
+    }
+
+    libDesc = (audio_effect_library_t *)dlsym(libHandle, AUDIO_EFFECT_LIBRARY_INFO_SYM_AS_STR);
+    if (libDesc == NULL) {
+        ALOGE("loadAxionFxEffect: failed to find %s symbol: %s",
+              AUDIO_EFFECT_LIBRARY_INFO_SYM_AS_STR, dlerror());
+        dlclose(libHandle);
+        return;
+    }
+
+    if (libDesc->tag != AUDIO_EFFECT_LIBRARY_TAG) {
+        ALOGE("loadAxionFxEffect: bad library tag %#08x, expected %#08x",
+              libDesc->tag, AUDIO_EFFECT_LIBRARY_TAG);
+        dlclose(libHandle);
+        return;
+    }
+
+    lib_entry_t *libEntry = (lib_entry_t *)malloc(sizeof(lib_entry_t));
+    if (libEntry == NULL) {
+        dlclose(libHandle);
+        return;
+    }
+
+    libEntry->name = strdup("axionfx");
+    libEntry->path = strdup(libPath);
+    libEntry->handle = libHandle;
+    libEntry->desc = libDesc;
+    libEntry->effects = NULL;
+    pthread_mutex_init(&libEntry->lock, NULL);
+
+    effect_descriptor_t *effectDesc = (effect_descriptor_t *)malloc(sizeof(effect_descriptor_t));
+    if (effectDesc == NULL) {
+        free(libEntry->name);
+        free(libEntry->path);
+        dlclose(libHandle);
+        free(libEntry);
+        return;
+    }
+
+    int ret = libDesc->get_descriptor(SL_IID_AXIONFX_IMPL, effectDesc);
+    if (ret != 0) {
+        ALOGE("loadAxionFxEffect: get_descriptor failed with %d", ret);
+        free(effectDesc);
+        free(libEntry->name);
+        free(libEntry->path);
+        dlclose(libHandle);
+        free(libEntry);
+        return;
+    }
+
+    list_elem_t *effectElem = (list_elem_t *)malloc(sizeof(list_elem_t));
+    if (effectElem == NULL) {
+        free(effectDesc);
+        free(libEntry->name);
+        free(libEntry->path);
+        dlclose(libHandle);
+        free(libEntry);
+        return;
+    }
+    effectElem->object = effectDesc;
+    effectElem->next = libEntry->effects;
+    libEntry->effects = effectElem;
+
+    list_elem_t *libElem = (list_elem_t *)malloc(sizeof(list_elem_t));
+    if (libElem == NULL) {
+        free(effectElem);
+        free(effectDesc);
+        free(libEntry->name);
+        free(libEntry->path);
+        dlclose(libHandle);
+        free(libEntry);
+        return;
+    }
+
+    pthread_mutex_lock(&gLibLock);
+    libElem->object = libEntry;
+    libElem->next = gLibraryList;
+    gLibraryList = libElem;
+    pthread_mutex_unlock(&gLibLock);
+
+    ALOGI("loadAxionFxEffect: registered AxionFx effect: %s", effectDesc->name);
 }
 

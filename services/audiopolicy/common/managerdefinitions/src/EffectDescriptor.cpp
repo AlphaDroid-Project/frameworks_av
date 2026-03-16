@@ -22,6 +22,7 @@
 #include "AudioInputDescriptor.h"
 #include "EffectDescriptor.h"
 #include <system/audio_effects/audio_effects_utils.h>
+#include <system/audio_effects/effect_axionfx.h>
 #include <system/audio_effects/effect_visualizer.h>
 #include <utils/String8.h>
 
@@ -182,6 +183,12 @@ bool EffectDescriptorCollection::isNonOffloadableEffectEnabled(
             effectDesc->mSession == AUDIO_SESSION_OUTPUT_MIX &&
             memcmp(&effectDesc->mDesc.type, SL_IID_VISUALIZATION, sizeof(effect_uuid_t)) == 0) {
             ALOGV("%s: visualizer effect enabled on global session, blocking offload", __func__);
+            return true;
+        }
+        if (effectDesc->mEnabled &&
+            effectDesc->mSession == AUDIO_SESSION_OUTPUT_MIX &&
+            memcmp(&effectDesc->mDesc.type, SL_IID_AXIONFX, sizeof(effect_uuid_t)) == 0) {
+            ALOGV("%s: AxionFx effect enabled on global session, blocking offload", __func__);
             return true;
         }
     }
