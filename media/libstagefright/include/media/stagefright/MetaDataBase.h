@@ -68,6 +68,7 @@ enum {
     kKeyThumbnailAV1C     = 'tav1',  // raw data
     kKeyD263              = 'd263',  // raw data
     kKeyOpusHeader        = 'ohdr',  // raw data
+    kKeyOplusUserData     = 'opud',  // cstring [PATCH OPLUSHDR]
     kKeyOpusCodecDelay    = 'ocod',  // uint64_t (codec delay in ns)
     kKeyOpusSeekPreRoll   = 'ospr',  // uint64_t (seek preroll in ns)
     kKeyVp9CodecPrivate   = 'vp9p',  // raw data (vp9 csd information)
