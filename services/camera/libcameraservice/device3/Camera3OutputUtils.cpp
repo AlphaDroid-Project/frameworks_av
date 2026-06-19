@@ -1031,8 +1031,14 @@ void collectAndRemovePendingOutputBuffers(bool useHalBufManager,
         sp<NotificationListener> listener, InFlightRequest& request,
         SessionStatsBuilder& sessionStatsBuilder,
         std::vector<BufferToReturn> *returnableBuffers) {
+    // Oplus still-capture brackets (e.g. front portrait TurboHDR) deliver non-monotonic, ZSL-style
+    // frames (older shutter/ring timestamps) WITHOUT setting ANDROID_CONTROL_ENABLE_ZSL=true. AOSP's
+    // monotonic-timestamp guard in Camera3Stream::returnBuffer would then mark the out-of-order frame
+    // as CAMERA_BUFFER_STATUS_ERROR -> onCaptureBufferLost, starving the Oplus APS merge (one frame
+    // short of MERGE_NUMBER) so the photo never finishes saving. Snapshot buffers don't require
+    // monotonic timestamps, so skip the guard for any still capture (not only ZSL still captures).
     bool timestampIncreasing =
-            !((request.zslCapture && request.stillCapture) || request.hasInputBuffer);
+            !(request.stillCapture || request.hasInputBuffer);
     nsecs_t readoutTimestamp = request.resultExtras.hasReadoutTimestamp ?
             request.resultExtras.readoutTimestamp : 0;
     collectReturnableOutputBuffers(useHalBufManager, halBufferManagedStreams, listener,
