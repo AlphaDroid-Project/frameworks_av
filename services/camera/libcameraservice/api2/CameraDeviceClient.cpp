@@ -2533,13 +2533,42 @@ void CameraDeviceClient::detachDevice() {
         {
             int64_t lastFrameNumber;
             status_t code;
-            if ((code = mDevice->flush(&lastFrameNumber)) != OK) {
-                ALOGE("%s: flush failed with code 0x%x", __FUNCTION__, code);
-            }
 
-            if ((code = mDevice->waitUntilDrained()) != OK) {
-                ALOGE("%s: waitUntilDrained failed with code 0x%x", __FUNCTION__,
-                        code);
+            // Teardown path differs for 3rd-party multi-camera (MCX) clients vs the Oplus app.
+            //
+            // The QTI multi-camera HAL (com.qti.chi.override.so ChiMulticameraBase::ExecuteFlush)
+            // takes the usecase lock and then waits for in-flight results to drain, while those
+            // result callbacks (OnProcessCaptureResult / OnProcessPartialCaptureResultCallback)
+            // need the SAME lock to be delivered -> AB/BA lock-inversion. Issuing a HAL flush()
+            // on such a session deadlocks; ~10 s later the CamX timer watchdog SIGABRTs the whole
+            // provider. This is reached when a streaming rear logical-camera client (e.g. Google
+            // Lens) is evicted because the foreground Oplus app reopens the rear camera on BACK.
+            //
+            // For non-Oplus clients we therefore mirror the orderly app-initiated close (the same
+            // path that tears down cleanly when Lens is dismissed via HOME): stop the repeating
+            // request and let the in-flight results drain naturally, and DO NOT issue the HAL
+            // flush(). CameraService eviction guarantees this completes before any conflicting
+            // Oplus rear open begins, so there is no concurrent open to starve the drain and the
+            // MCX session drains instead of deadlocking.
+            //
+            // The Oplus camera HAL still needs the legacy flush() workaround below (it refuses to
+            // disconnect while there are streams in flight), so keep the original behaviour there.
+            std::string pkgName = getPackageName();
+            if (pkgName != "com.oplus.camera") {
+                if ((code = mDevice->clearStreamingRequest(&lastFrameNumber)) != OK) {
+                    ALOGE("%s: clearStreamingRequest failed with code 0x%x", __FUNCTION__, code);
+                }
+                if ((code = mDevice->waitUntilDrained()) != OK) {
+                    ALOGE("%s: waitUntilDrained failed with code 0x%x", __FUNCTION__, code);
+                }
+            } else {
+                if ((code = mDevice->flush(&lastFrameNumber)) != OK) {
+                    ALOGE("%s: flush failed with code 0x%x", __FUNCTION__, code);
+                }
+                if ((code = mDevice->waitUntilDrained()) != OK) {
+                    ALOGE("%s: waitUntilDrained failed with code 0x%x", __FUNCTION__,
+                            code);
+                }
             }
         }
 

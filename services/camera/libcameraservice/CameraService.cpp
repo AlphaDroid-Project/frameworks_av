@@ -2132,6 +2132,57 @@ status_t CameraService::handleEvictionsLocked(const std::string& cameraId, int c
             evicted.clear();
         }
 
+        // --- OPLUS PORT: Force symmetric eviction for cameras sharing physical sensors ---
+        // Camera IDs 0 and 2 share the rear main sensor. The HAL declares
+        // 0 conflicts with 2, but NOT 2 conflicts with 0 (asymmetric).
+        // This causes a provider deadlock when camera 2 opens while camera 0's
+        // (logical-4 RealTimeMCX) session is still live (Google-Lens → back).
+        // Force the missing direction: evict the peer (0<->2) when one connects.
+        //
+        // NOTE: this MUST run AFTER the isPrivilegedClient() clear above —
+        // com.oplus.camera is in persist.vendor.camera.privapp.list, so the clear
+        // wipes the normal evicted set; if we forced the peer before the clear it
+        // would be erased and the concurrent open would deadlock the provider.
+        {
+            std::string conflictPeer;
+            if (cameraId == "2") conflictPeer = "0";
+            else if (cameraId == "0") conflictPeer = "2";
+
+            // [OplusPort][DIAG] Unconditional trace: confirm this block runs and dump the
+            // active-client set at connect time so we can see why the peer is/ isn't found.
+            {
+                std::string activeKeys;
+                for (const auto& k : mActiveClientManager.getAllKeys()) {
+                    activeKeys += k;
+                    activeKeys += " ";
+                }
+                auto peerProbe = conflictPeer.empty() ? nullptr
+                        : mActiveClientManager.get(conflictPeer);
+                ALOGE("[OplusPort][DIAG] handleEvictions cameraId=%s pkg=%s conflictPeer=%s "
+                      "peerFound=%d activeKeys=[ %s] evictedN(after privclear)=%zu",
+                      cameraId.c_str(), packageName.c_str(),
+                      conflictPeer.empty() ? "(none)" : conflictPeer.c_str(),
+                      (peerProbe != nullptr && peerProbe->getValue() != nullptr) ? 1 : 0,
+                      activeKeys.c_str(), evicted.size());
+            }
+
+            if (!conflictPeer.empty()) {
+                auto peerClient = mActiveClientManager.get(conflictPeer);
+                if (peerClient != nullptr && peerClient->getValue() != nullptr) {
+                    if (std::find(evicted.begin(), evicted.end(), peerClient) == evicted.end()) {
+                        ALOGE("[OplusPort] Force-evicting camera %s client %s (PID %" PRId32
+                              ") — asymmetric conflict with camera %s",
+                              conflictPeer.c_str(),
+                              peerClient->getValue()->getPackageName().c_str(),
+                              peerClient->getOwnerId(),
+                              cameraId.c_str());
+                        evicted.push_back(peerClient);
+                    }
+                }
+            }
+        }
+        // -----------------------------------------------------------------------
+
         // If the incoming client was 'evicted,' higher priority clients have the camera in the
         // background, so we cannot do evictions
         if (std::find(evicted.begin(), evicted.end(), clientDescriptor) != evicted.end()) {
