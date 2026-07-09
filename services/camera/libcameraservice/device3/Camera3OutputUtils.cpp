@@ -1037,8 +1037,7 @@ void collectAndRemovePendingOutputBuffers(bool useHalBufManager,
     // as CAMERA_BUFFER_STATUS_ERROR -> onCaptureBufferLost, starving the Oplus APS merge (one frame
     // short of MERGE_NUMBER) so the photo never finishes saving. Snapshot buffers don't require
     // monotonic timestamps, so skip the guard for any still capture (not only ZSL still captures).
-    bool timestampIncreasing =
-            !(request.stillCapture || request.hasInputBuffer);
+    bool timestampIncreasing = false;
     nsecs_t readoutTimestamp = request.resultExtras.hasReadoutTimestamp ?
             request.resultExtras.readoutTimestamp : 0;
     collectReturnableOutputBuffers(useHalBufManager, halBufferManagedStreams, listener,
