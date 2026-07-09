@@ -32,6 +32,8 @@
 
 #include <inttypes.h>
 
+#include <cutils/properties.h>
+
 #include <utils/Log.h>
 #include <utils/SortedVector.h>
 #include <utils/Trace.h>
@@ -1031,13 +1033,18 @@ void collectAndRemovePendingOutputBuffers(bool useHalBufManager,
         sp<NotificationListener> listener, InFlightRequest& request,
         SessionStatsBuilder& sessionStatsBuilder,
         std::vector<BufferToReturn> *returnableBuffers) {
-    // Oplus still-capture brackets (e.g. front portrait TurboHDR) deliver non-monotonic, ZSL-style
-    // frames (older shutter/ring timestamps) WITHOUT setting ANDROID_CONTROL_ENABLE_ZSL=true. AOSP's
-    // monotonic-timestamp guard in Camera3Stream::returnBuffer would then mark the out-of-order frame
-    // as CAMERA_BUFFER_STATUS_ERROR -> onCaptureBufferLost, starving the Oplus APS merge (one frame
-    // short of MERGE_NUMBER) so the photo never finishes saving. Snapshot buffers don't require
-    // monotonic timestamps, so skip the guard for any still capture (not only ZSL still captures).
-    bool timestampIncreasing = false;
+    // Oplus capture pipelines (front portrait TurboHDR brackets, ALGO_YUVSR 20x zoom, Turbo Night)
+    // deliver non-monotonic, ZSL-style frames (older shutter/ring timestamps) on requests that are
+    // not flagged ENABLE_ZSL=true or even STILL_CAPTURE. AOSP's monotonic-timestamp guard in
+    // Camera3Stream::returnBuffer would then mark the out-of-order frame as
+    // CAMERA_BUFFER_STATUS_ERROR -> onCaptureBufferLost, starving the Oplus APS merge (one frame
+    // short of MERGE_NUMBER) so the photo never finishes saving. Devices shipping the Oplus camera
+    // port disable the guard entirely via ro.camera.relax_timestamp_guard; everyone else keeps the
+    // AOSP behavior (guard active except for still captures / reprocessing).
+    static const bool sRelaxTimestampGuard =
+            property_get_bool("ro.camera.relax_timestamp_guard", false);
+    bool timestampIncreasing = !sRelaxTimestampGuard &&
+            !(request.stillCapture || request.hasInputBuffer);
     nsecs_t readoutTimestamp = request.resultExtras.hasReadoutTimestamp ?
             request.resultExtras.readoutTimestamp : 0;
     collectReturnableOutputBuffers(useHalBufManager, halBufferManagedStreams, listener,
